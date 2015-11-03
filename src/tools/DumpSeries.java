@@ -16,6 +16,7 @@ import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.Map;
 
 import org.hbase.async.DeleteRequest;
@@ -44,6 +45,7 @@ final class DumpSeries {
     System.err.println(errmsg);
     System.err.println("Usage: scan"
         + " [--delete|--import] START-DATE [END-DATE] query [queries...]\n"
+        + " [--batch-delete-older] END-DATE meter-name-prefix\n"
         + "To see the format in which queries should be written, see the help"
         + " of the 'query' command.\n"
         + "The --import flag changes the format in which the output is printed"
@@ -62,12 +64,8 @@ final class DumpSeries {
     argp.addOption("--import", "Prints the rows in a format suitable for"
                    + " the 'import' command.");
     argp.addOption("--delete", "Deletes rows as they are scanned.");
+    argp.addOption("--batch-delete-older", "Scans meters matching a prefix and delete.");
     args = CliOptions.parse(argp, args);
-    if (args == null) {
-      usage(argp, "Invalid usage.", 1);
-    } else if (args.length < 3) {
-      usage(argp, "Not enough arguments.", 2);
-    }
 
     // get a config object
     Config config = CliOptions.getConfig(argp);
@@ -77,11 +75,37 @@ final class DumpSeries {
     final byte[] table = config.getString("tsd.storage.hbase.data_table").getBytes();
     final boolean delete = argp.has("--delete");
     final boolean importformat = delete || argp.has("--import");
+    final boolean batch_delete_older = argp.has("--batch-delete-older");
     argp = null;
+
+    if (args == null) {
+      usage(argp, "Invalid usage.", 1);
+    } else if (batch_delete_older) {
+      if (args.length != 2) {
+        usage(argp, "Wrong number of arguments with option --batch-delete-older.", 2);
+      }
+    } else if (args.length < 3) {
+      usage(argp, "Not enough arguments.", 2);
+    }
+
     try {
-      doDump(tsdb, tsdb.getClient(), table, delete, importformat, args);
+      if (batch_delete_older) {
+        batchDelete(tsdb, table, args[0], args[1]);
+      } else {
+        doDump(tsdb, tsdb.getClient(), table, delete, importformat, false, args);
+      }
     } finally {
       tsdb.shutdown().joinUninterruptibly();
+    }
+  }
+
+  private static void batchDelete(TSDB tsdb, byte[] table, String endTime, String meterPrefix) throws Exception {
+    final List<String> meters = tsdb.suggestMetrics(meterPrefix, Integer.MAX_VALUE);
+    for (String meter : meters) {
+      System.out.print("Issue batch delete for meter: " + meter + "...");
+      long t0 = System.currentTimeMillis();
+      doDump(tsdb, tsdb.getClient(), table, true, false, true, new String[] { "0", endTime, "sum", meter });
+      System.out.println(" done. Took " + (System.currentTimeMillis() - t0) + "ms");
     }
   }
 
@@ -90,50 +114,20 @@ final class DumpSeries {
                              final byte[] table,
                              final boolean delete,
                              final boolean importformat,
+                             final boolean quiet,
                              final String[] args) throws Exception {
     final ArrayList<Query> queries = new ArrayList<Query>();
     CliQuery.parseCommandLineQuery(args, tsdb, queries, null, null);
 
-    final StringBuilder buf = new StringBuilder();
     for (final Query query : queries) {
       final Scanner scanner = Internal.getScanner(query);
       ArrayList<ArrayList<KeyValue>> rows;
       while ((rows = scanner.nextRows().joinUninterruptibly()) != null) {
         for (final ArrayList<KeyValue> row : rows) {
-          buf.setLength(0);
           final byte[] key = row.get(0).key();
-          final long base_time = Internal.baseTime(tsdb, key);
-          final String metric = Internal.metricName(tsdb, key);
-          // Print the row key.
-          if (!importformat) {
-            buf.append(Arrays.toString(key))
-              .append(' ')
-              .append(metric)
-              .append(' ')
-              .append(base_time)
-              .append(" (").append(date(base_time)).append(") ");
-            try {
-              buf.append(Internal.getTags(tsdb, key));
-            } catch (RuntimeException e) {
-              buf.append(e.getClass().getName() + ": " + e.getMessage());
-            }
-            buf.append('\n');
-            System.out.print(buf);
-          }
-
-          // Print individual cells.
-          buf.setLength(0);
-          if (!importformat) {
-            buf.append("  ");
-          }
-          for (final KeyValue kv : row) {
-            // Discard everything or keep initial spaces.
-            buf.setLength(importformat ? 0 : 2);
-            formatKeyValue(buf, tsdb, importformat, kv, base_time, metric);
-            if (buf.length() > 0) {
-              buf.append('\n');
-              System.out.print(buf);
-            }
+          
+          if (!quiet) {
+            writeOutout(tsdb, importformat, row, key);
           }
 
           if (delete) {
@@ -141,6 +135,44 @@ final class DumpSeries {
             client.delete(del);
           }
         }
+      }
+    }
+  }
+
+  private static void writeOutout(final TSDB tsdb, final boolean importformat, final ArrayList<KeyValue> row, final byte[] key) {
+    final StringBuilder buf = new StringBuilder();
+    final long base_time = Internal.baseTime(tsdb, key);
+    final String metric = Internal.metricName(tsdb, key);
+
+    // Print the row key.
+    if (!importformat) {
+      buf.append(Arrays.toString(key))
+        .append(' ')
+        .append(metric)
+        .append(' ')
+        .append(base_time)
+        .append(" (").append(date(base_time)).append(") ");
+      try {
+        buf.append(Internal.getTags(tsdb, key));
+      } catch (RuntimeException e) {
+        buf.append(e.getClass().getName() + ": " + e.getMessage());
+      }
+      buf.append('\n');
+      System.out.print(buf);
+    }
+
+    // Print individual cells.
+    buf.setLength(0);
+    if (!importformat) {
+      buf.append("  ");
+    }
+    for (final KeyValue kv : row) {
+      // Discard everything or keep initial spaces.
+      buf.setLength(importformat ? 0 : 2);
+      formatKeyValue(buf, tsdb, importformat, kv, base_time, metric);
+      if (buf.length() > 0) {
+        buf.append('\n');
+        System.out.print(buf);
       }
     }
   }
