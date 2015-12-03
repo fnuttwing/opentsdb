@@ -12,17 +12,21 @@
 // see <http://www.gnu.org/licenses/>.
 package net.opentsdb.tools;
 
+import java.lang.Thread.UncaughtExceptionHandler;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.hbase.async.DeleteRequest;
 import org.hbase.async.HBaseClient;
 import org.hbase.async.KeyValue;
 import org.hbase.async.Scanner;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import net.opentsdb.core.Const;
 import net.opentsdb.core.IllegalDataException;
@@ -99,17 +103,64 @@ final class DumpSeries {
     }
   }
 
-  private static void batchDelete(TSDB tsdb, byte[] table, String endTime, String meterPrefix) throws Exception {
+  private static void batchDelete(final TSDB tsdb, final byte[] table, final String endTime, final String meterPrefix) throws Exception {
     final List<String> meters = tsdb.suggestMetrics(meterPrefix, Integer.MAX_VALUE);
-    for (String meter : meters) {
-      System.out.print("Issue batch delete for meter: " + meter + "...");
-      long t0 = System.currentTimeMillis();
-      doDump(tsdb, tsdb.getClient(), table, true, false, true, new String[] { "0", endTime, "sum", meter });
-      System.out.println(" done. Took " + (System.currentTimeMillis() - t0) + "ms");
+    final int totalMeterCnt = meters.size();
+    final AtomicInteger metersProcessed = new AtomicInteger();
+    
+    final int delete_threads = 16;
+    final Thread[] threads = new Thread[delete_threads];
+    
+    for (int t = 0; t < delete_threads; t++) {
+        final int threadNum = t;
+
+        threads[threadNum] = new Thread(new Runnable() {
+            public void run() {
+                try {
+                    while (true) {
+                        String meter;
+                        synchronized (meters) {
+                            if (meters.isEmpty()) {
+                                return;
+                            }
+                            meter = meters.remove(0);
+                            System.out.println("[" + threadNum + "] Issue batch delete for meter: " + meter + "... (" + metersProcessed.incrementAndGet() + "/" + totalMeterCnt + ")");
+                        }
+                        long t0 = System.currentTimeMillis();
+                        long cnt = doDump(tsdb, tsdb.getClient(), table, true, false, true, new String[] { "0", endTime, "sum", meter });
+                        System.out.println("[" + threadNum + "] Done batch delete for meter: " + meter + ". Touched " + cnt + " rows in " + (System.currentTimeMillis() - t0) + "ms");
+                    }
+                } catch (RuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
+                }
+            }
+        });
+        
+        UncaughtExceptionHandler exceptionHandler = new UncaughtExceptionHandler() {
+            @Override
+            public void uncaughtException(Thread thread, Throwable throwable) {
+                System.err.println("Thread [" + threadNum + "] died with: " + throwable.getMessage());
+                throwable.printStackTrace(System.err);
+            }
+        };
+
+        threads[threadNum].setUncaughtExceptionHandler(exceptionHandler);
+        threads[threadNum].start();
+    }
+    
+    for (int t = 0; t < delete_threads; t++) {
+        try {
+            threads[t].join();
+        } catch (Exception e) {
+            System.err.println("Error joining Thread [" + t + "] died with: " + e.getMessage());
+            e.printStackTrace(System.err);
+        }
     }
   }
 
-  private static void doDump(final TSDB tsdb,
+  private static long doDump(final TSDB tsdb,
                              final HBaseClient client,
                              final byte[] table,
                              final boolean delete,
@@ -119,11 +170,17 @@ final class DumpSeries {
     final ArrayList<Query> queries = new ArrayList<Query>();
     CliQuery.parseCommandLineQuery(args, tsdb, queries, null, null);
 
+    long rowCnt = 0;
+    long tickTime = System.currentTimeMillis() + 60000;
+    long tickCnt = 0;
+    
     for (final Query query : queries) {
       final Scanner scanner = Internal.getScanner(query);
+
       ArrayList<ArrayList<KeyValue>> rows;
       while ((rows = scanner.nextRows().joinUninterruptibly()) != null) {
         for (final ArrayList<KeyValue> row : rows) {
+          rowCnt++;
           final byte[] key = row.get(0).key();
           
           if (!quiet) {
@@ -131,12 +188,19 @@ final class DumpSeries {
           }
 
           if (delete) {
+              if (System.currentTimeMillis() > tickTime) {
+                  System.out.println("Still (" + (++tickCnt) + ") deleting " + args[3] + " rows touched = " + rowCnt);
+                  tickTime = System.currentTimeMillis() + 60000;
+              }
+
             final DeleteRequest del = new DeleteRequest(table, key);
             client.delete(del);
           }
         }
       }
     }
+    
+    return rowCnt;
   }
 
   private static void writeOutout(final TSDB tsdb, final boolean importformat, final ArrayList<KeyValue> row, final byte[] key) {
